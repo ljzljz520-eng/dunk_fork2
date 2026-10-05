@@ -1,5 +1,6 @@
 import functools
 import os
+import stat
 import sys
 from collections import defaultdict
 from difflib import SequenceMatcher
@@ -23,9 +24,14 @@ import dunk
 from dunk.renderables import (
     PatchSetHeader,
     RemovedFileBody,
+    RestrictedSourceNotice,
     BinaryFileBody,
     PatchedFileHeader,
     OnlyRenamedFileBody,
+    decode_git_path,
+    sanitize_code,
+    sanitize_text,
+    strip_git_prefix,
 )
 
 MONOKAI_LIGHT_ACCENT = Color.from_rgb(62, 64, 54).triplet.hex
@@ -56,6 +62,120 @@ def find_git_root() -> Path:
             return directory
 
     return cwd
+
+
+class ResolvedTarget(NamedTuple):
+    """A file safely bound to the repository work tree."""
+
+    fd: int
+    stat_result: os.stat_result
+
+
+def validate_repo_path(path: str) -> Optional[List[str]]:
+    """Split a decoded path into components that stay inside the repo root.
+
+    Absolute paths, empty segments (``//``), NUL bytes and parent traversal
+    (``..``) are rejected.  ``.`` segments are identity.
+    """
+    if not path or path.startswith("/") or "\x00" in path:
+        return None
+
+    components: List[str] = []
+    for part in path.split("/"):
+        if part == "" or part == "..":
+            return None
+        if part == ".":
+            continue
+        components.append(part)
+    return components or None
+
+
+def _open_within_root(root: Path, components: List[str]) -> Optional[ResolvedTarget]:
+    """Open ``root/components`` while refusing symlinks and races.
+
+    The tree is descended using directory file descriptors (``openat``) and
+    ``O_NOFOLLOW`` on every component, so neither intermediate nor final
+    components may be symlinks.  The opened file descriptor is fstat'd and
+    its identity is re-checked through the same directory handle to defeat
+    check-then-replace (TOCTOU) attacks; all subsequent reads use the held
+    descriptor.
+    """
+    directory_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY
+
+    root_fd = os.open(os.fspath(root), os.O_RDONLY | os.O_DIRECTORY)
+    intermediate_fds: List[int] = []
+    try:
+        current_fd = root_fd
+        for name in components[:-1]:
+            next_fd = os.open(name, directory_flags, dir_fd=current_fd)
+            intermediate_fds.append(next_fd)
+            current_fd = next_fd
+
+        file_fd = os.open(
+            components[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=current_fd
+        )
+        try:
+            file_stat = os.fstat(file_fd)
+            if not stat.S_ISREG(file_stat.st_mode):
+                return None
+
+            # Identity re-check through the held directory handle: if the
+            # name was swapped (including for a symlink) after the open, the
+            # two identities no longer match.
+            name_stat = os.stat(
+                components[-1], dir_fd=current_fd, follow_symlinks=False
+            )
+            if stat.S_ISLNK(name_stat.st_mode) or (
+                file_stat.st_dev,
+                file_stat.st_ino,
+            ) != (name_stat.st_dev, name_stat.st_ino):
+                return None
+
+            return ResolvedTarget(file_fd, file_stat)
+        except BaseException:
+            os.close(file_fd)
+            raise
+    finally:
+        for fd in intermediate_fds:
+            os.close(fd)
+        os.close(root_fd)
+
+
+def resolve_patch_target(
+    root: Path, raw_path: str
+) -> Tuple[Optional[ResolvedTarget], str]:
+    """Resolve an untrusted patch path to a descriptor bound to ``root``.
+
+    Returns ``(resolved, reason)`` where ``resolved`` is ``None`` when the
+    file can't be safely read; ``reason`` is a static status string.
+    """
+    decoded = decode_git_path(raw_path)
+    if decoded is None:
+        return None, "malformed quoted path in patch metadata"
+
+    components = validate_repo_path(strip_git_prefix(decoded))
+    if components is None:
+        return None, "path is absolute or escapes the repository root"
+
+    try:
+        target = _open_within_root(root, components)
+    except OSError:
+        return None, "path could not be safely opened within the repository"
+
+    if target is None:
+        return None, "path is a symlink or is not a regular file in the repository"
+
+    return target, ""
+
+
+def _read_fd_all(fd: int) -> bytes:
+    chunks = []
+    while True:
+        chunk = os.read(fd, 1024 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 #
@@ -116,45 +236,78 @@ def _run_dunk():
             console.print(RemovedFileBody())
             continue
 
-        # The file wasn't removed, so we can open it.
-        target_file = project_root / patch.path
-
-        if patch.is_binary_file:
-            console.print(BinaryFileBody(size_in_bytes=target_file.stat().st_size))
+        if patch.is_rename and not patch.added and not patch.removed:
+            # Pure rename: there is nothing to read, avoid touching the disk.
+            console.print(OnlyRenamedFileBody(patch))
             continue
 
-        if patch.is_rename and not patch.added and not patch.removed:
-            console.print(OnlyRenamedFileBody(patch))
+        # Patch metadata is untrusted: only accept a target file that can
+        # be safely bound to the repository work tree.
+        resolved, restriction_reason = resolve_patch_target(
+            project_root, patch.target_file
+        )
+        is_restricted = resolved is None
+        if is_restricted:
+            console.print(RestrictedSourceNotice(restriction_reason))
 
-        source_lineno = 1
-        target_lineno = 1
+        if patch.is_binary_file:
+            size = resolved.stat_result.st_size if resolved is not None else None
+            if resolved is not None:
+                os.close(resolved.fd)
+            console.print(
+                BinaryFileBody(size_in_bytes=size, restricted=is_restricted)
+            )
+            continue
 
-        target_code = target_file.read_text()
-        target_lines = target_code.splitlines(keepends=True)
-        source_lineno_max = len(target_lines) - patch.added + patch.removed
+        if resolved is not None:
+            try:
+                target_code = sanitize_code(
+                    _read_fd_all(resolved.fd).decode(
+                        "utf-8", errors="replace"
+                    )
+                )
+            finally:
+                os.close(resolved.fd)
 
-        source_hunk_cache: Dict[int, Hunk] = {hunk.source_start: hunk for hunk in patch}
-        source_reconstructed: List[str] = []
+            target_lines = target_code.splitlines(keepends=True)
+            source_lineno_max = len(target_lines) - patch.added + patch.removed
 
-        while source_lineno <= source_lineno_max:
-            hunk = source_hunk_cache.get(source_lineno)
-            if hunk:
-                # This line can be reconstructed in source from the hunk
-                lines = [line.value for line in hunk.source_lines()]
-                source_reconstructed.extend(lines)
-                source_lineno += hunk.source_length
-                target_lineno += hunk.target_length
-            else:
-                # The line isn't in the diff, pull over current target lines
-                target_line_index = target_lineno - 1
+            source_hunk_cache: Dict[int, Hunk] = {
+                hunk.source_start: hunk for hunk in patch
+            }
+            source_reconstructed: List[str] = []
 
-                line = target_lines[target_line_index]
-                source_reconstructed.append(line)
+            source_lineno = 1
+            target_lineno = 1
+            while source_lineno <= source_lineno_max:
+                hunk = source_hunk_cache.get(source_lineno)
+                if hunk:
+                    # This line can be reconstructed in source from the hunk
+                    lines = [
+                        sanitize_code(line.value)
+                        for line in hunk.source_lines()
+                    ]
+                    source_reconstructed.extend(lines)
+                    source_lineno += hunk.source_length
+                    target_lineno += hunk.target_length
+                else:
+                    # The line isn't in the diff, pull over current target lines
+                    target_line_index = target_lineno - 1
 
-                source_lineno += 1
-                target_lineno += 1
+                    line = target_lines[target_line_index]
+                    source_reconstructed.append(line)
 
-        source_code = "".join(source_reconstructed)
+                    source_lineno += 1
+                    target_lineno += 1
+
+            source_code = "".join(source_reconstructed)
+        else:
+            # Restricted: no on-disk content, render per-hunk snippets built
+            # solely from lines embedded in the patch.
+            target_code = ""
+            source_code = ""
+            source_lineno_max = 0
+
         lexer = Syntax.guess_lexer(patch.path)
 
         for is_first_hunk, hunk in loop_first(patch):
@@ -169,20 +322,54 @@ def _run_dunk():
                 hunk.source_length + hunk.source_start - 1,
             )
 
-            source_syntax = Syntax(
-                source_code,
-                lexer=lexer,
-                line_range=source_line_range,
-                line_numbers=True,
-                indent_guides=True,
-            )
-            target_syntax = Syntax(
-                target_code,
-                lexer=lexer,
-                line_range=target_line_range,
-                line_numbers=True,
-                indent_guides=True,
-            )
+            if not is_restricted:
+                source_syntax = Syntax(
+                    source_code,
+                    lexer=lexer,
+                    line_range=source_line_range,
+                    line_numbers=True,
+                    indent_guides=True,
+                )
+                target_syntax = Syntax(
+                    target_code,
+                    lexer=lexer,
+                    line_range=target_line_range,
+                    line_numbers=True,
+                    indent_guides=True,
+                )
+                source_gutter_size = len(str(source_lineno_max)) + 2
+                target_gutter_size = len(str(len(target_code.splitlines()) + 1)) + 2
+            else:
+                # Prefix the snippet with blank lines so absolute line
+                # numbers are shown, then clip with line_range.
+                source_hunk_code = "".join(
+                    sanitize_code(line.value)
+                    for line in hunk.source_lines()
+                )
+                target_hunk_code = "".join(
+                    sanitize_code(line.value)
+                    for line in hunk.target_lines()
+                )
+                source_syntax = Syntax(
+                    "\n" * max(0, hunk.source_start - 1) + source_hunk_code,
+                    lexer=lexer,
+                    line_range=source_line_range,
+                    line_numbers=True,
+                    indent_guides=True,
+                )
+                target_syntax = Syntax(
+                    "\n" * max(0, hunk.target_start - 1) + target_hunk_code,
+                    lexer=lexer,
+                    line_range=target_line_range,
+                    line_numbers=True,
+                    indent_guides=True,
+                )
+                source_gutter_size = (
+                    len(str(max(1, hunk.source_start + hunk.source_length - 1))) + 2
+                )
+                target_gutter_size = (
+                    len(str(max(1, hunk.target_start + hunk.target_length - 1))) + 2
+                )
             source_removed_linenos = set()
             target_added_linenos = set()
 
@@ -340,7 +527,9 @@ def _run_dunk():
                 )
                 if target_line and are_diffable:
                     matcher = SequenceMatcher(
-                        None, source_line.value, target_line.value
+                        None,
+                        sanitize_code(source_line.value),
+                        sanitize_code(target_line.value),
                     )
                     opcodes = matcher.get_opcodes()
                     ratio = matcher.ratio()
@@ -374,7 +563,7 @@ def _run_dunk():
                 ColorTriplet(255, 0, 0),
                 source_lineno_to_padding,
                 dict(row_number_to_deletion_ranges),
-                gutter_size=len(str(source_lineno_max)) + 2,
+                gutter_size=source_gutter_size,
             )
             highlighted_target_lines = highlight_and_align_lines_in_hunk(
                 hunk.target_start,
@@ -383,7 +572,7 @@ def _run_dunk():
                 ColorTriplet(0, 255, 0),
                 target_lineno_to_padding,
                 dict(row_number_to_insertion_ranges),
-                gutter_size=len(str(len(target_lines) + 1)) + 2,
+                gutter_size=target_gutter_size,
             )
 
             table = Table.grid()
@@ -395,11 +584,17 @@ def _run_dunk():
             )
 
             hunk_header_style = f"{MONOKAI_BACKGROUND.triplet.hex} on #0d0f0b"
-            hunk_header = (
-                f"[on #0d0f0b dim]@@ [red]-{hunk.source_start},{hunk.source_length}[/] "
-                f"[green]+{hunk.target_start},{hunk.target_length}[/] "
-                f"[dim]@@ {hunk.section_header or ''}[/]"
+            hunk_header = Text(style="dim on #0d0f0b")
+            hunk_header.append("@@ ")
+            hunk_header.append(
+                f"-{hunk.source_start},{hunk.source_length}", style="red"
             )
+            hunk_header.append(" ")
+            hunk_header.append(
+                f"+{hunk.target_start},{hunk.target_length}", style="green"
+            )
+            hunk_header.append(" @@ ")
+            hunk_header.append_text(sanitize_text(hunk.section_header or ""))
             console.rule(hunk_header, characters="╲", style=hunk_header_style)
             console.print(table)
 
@@ -408,7 +603,13 @@ def _run_dunk():
 
     console.print(
         Align.right(
-            f"[blue]/[/][red]/[/][green]/[/] [dim]dunk {dunk.__version__}[/]   "
+            Text.assemble(
+                ("/", "blue"),
+                ("/", "red"),
+                ("/", "green"),
+                (" dunk " + dunk.__version__, "dim"),
+                ("   ",),
+            )
         )
     )
     # console.save_svg("dunk.svg", title="Diff output generated using Dunk")
